@@ -1,0 +1,206 @@
+# Written by Dongha Kim.
+# partly copied from another project's module.
+"""
+    Managed Web-driver Objects that are helpful for web scraping.
+    Supports requests.session, selenium.
+"""
+
+import sys
+import os
+import functools
+import warnings
+
+from requests import sessions
+from selenium import webdriver
+from selenium.common.exceptions import NoSuchWindowException
+
+
+__all__ = ["DriverTab", "ManagedWebDriver", "ManagedSession", "get_initial_driver"]
+
+
+class Base(object):
+    """Base managed-webdriver class with slot"""
+
+    def __init__(self):
+        self.slot = {}
+
+    def close(self):
+        raise NotImplementedError
+
+    def quit(self):
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, klass=None, value=None, traceback=None):
+        self.close()
+
+    def __getitem__(self, key):
+        return self.slot[key]
+
+    def __setitem__(self, key, value):
+        self.slot[key] = value
+
+    def __delitem__(self, key):
+        del self.slot[key]
+
+
+class ManagedSeleniumWebDriver(Base):
+    """Managed selenium Web Driver."""
+
+    def __init__(self, klass, /, *args, **kwargs):
+        Base.__init__(self)
+
+        # Default
+        if isinstance(klass, type) and issubclass(klass, webdriver.Remote):
+            self.args = args
+            self.kwargs = kwargs
+            self.driver = klass(*self.args, **self.kwargs)
+
+        # ManagedWebDriver object passed through klass - copy cookies
+        elif isinstance(klass, self.__class__):
+            self.args = args + klass.args
+            self.kwargs = klass.kwargs.copy()
+            self.kwargs.update(kwargs)
+            self.driver = klass.driver.__class__(*self.args, **self.kwargs)
+            self.__copy_cookies_from_driver(klass.driver)
+
+        # WebDriver object passed through klass - copy cookies
+        elif isinstance(klass, webdriver.Remote):
+            self.args = args
+            self.kwargs = kwargs
+            self.driver = klass.__class__(*self.args, **self.kwargs)
+            self.__copy_cookies_from_driver(klass)
+
+        else:
+            raise TypeError
+
+    def __copy_cookies_from_driver(self, driver):
+        for cookie in driver.get_cookies():
+            self.driver.add_cookie(cookie)
+
+    def copy_driver(self):
+        return self.__class__(self)
+
+    def close(self):
+        self.driver.quit()
+
+    def execute_function(self, func, *args, **kwargs):
+        if callable(func):
+            return func(self.driver, *args, **kwargs)
+        elif isinstance(func, str):
+            return getattr(self.driver, func)(*args, **kwargs)
+        else:
+            return TypeError(
+                'First argument must be callable(outer function) or string(inner method).'
+            )
+
+
+class ManagedSeleniumTab(Base):
+    """Managed selenium new tab."""
+
+    def __init__(self, driver, /, url=None):
+        Base.__init__(self)
+        self.url = url
+        self.driver = driver  # TODO: driver type?
+        self.window_set = set(self.window_all)
+        try:
+            self.window_old = driver.current_window_handle
+        except NoSuchWindowException:
+            self.window_old = self.window_all[0]
+        self.window_new = None
+
+    def __enter__(self):
+        driver = self.driver
+        driver.execute_script("window.open('%s');" % (self.url or ""))
+        window_set_sub = (set(self.window_all) - self.window_set)
+        assert len(window_set_sub) == 1
+        self.window_new = window_set_sub.pop()
+        driver.switch_to.window(self.window_new)
+        return driver
+
+    def close(self):
+        driver = self.driver
+        if self.window_new in self.window_all:
+            driver.switch_to.window(self.window_new)
+            driver.close()
+        try:
+            driver.switch_to.window(self.window_old)
+        except NoSuchWindowException:
+            driver.switch_to.window(self.window_all[0])
+
+    @property
+    def window_all(self):
+        return self.driver.window_handles
+
+
+class ManagedSession(Base):
+    """Managed requests.sessions.Session class. You can copy cookies from another managed object."""
+
+    session = None
+    patched = False
+
+    def __init__(self, other=None):
+        Base.__init__(self)
+        self.__prepare_session()
+        if other:
+            self.__copy_cookies_from_other(other)
+
+    def __prepare_session(self):
+        s = sessions.session()
+        s.headers.update({
+            "User-Agent":
+                "Mozilla/5.0 (Windows NT 6.3; WOW64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/44.0.2403.157 "
+                "Safari/537.36"
+        })
+        self.session = s
+
+    @classmethod
+    def patch_session_methods(cls):
+        """registers session's method to ManagedSession class."""
+        def register_session_method(method_name, method=None):
+            def inner(_self, *args, **kwargs):
+                return getattr(_self.session, method_name)(*args, **kwargs)
+            if method is not None:
+                functools.update_wrapper(inner, method)
+            setattr(cls, method_name, inner)
+        if cls.patched:
+            return
+        # not-constructed object's method is function-type.
+        func_type = type(register_session_method)
+        session_class = sessions.Session
+        for name, attr in session_class.__dict__.items():
+            if (
+                    not name.startswith('_') and
+                    not hasattr(cls, name) and
+                    isinstance(attr, func_type)
+            ):
+                register_session_method(name, attr)
+        cls.patched = True
+
+    def __copy_cookies_from_other(self, other):
+        cookies = None
+        if isinstance(other, self.__class__):
+            self.session.cookies.update(other.session.cookies)
+            return
+        elif isinstance(other, sessions.Session):
+            self.session.cookies.update(other.cookies)
+            return
+        elif isinstance(other, ManagedWebDriver):
+            cookies = other.driver.get_cookies()
+        elif isinstance(other, webdriver.Remote):
+            cookies = other.get_cookies()
+        if cookies:
+            for cookie in cookies:
+                c = {cookie['name']: cookie['value']}
+                self.session.cookies.update(c)
+
+    def close(self):
+        self.session.close()
+
+
+ManagedSession.patch_session_methods()
+
