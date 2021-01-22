@@ -15,7 +15,7 @@ from selenium import webdriver
 from selenium.common.exceptions import NoSuchWindowException
 
 
-__all__ = ["DriverTab", "ManagedWebDriver", "ManagedSession", "get_initial_driver"]
+__all__ = ["ManagedSeleniumWebDriver", "ManagedSeleniumTab", "ManagedSession"]
 
 
 class Base(object):
